@@ -1,0 +1,1931 @@
+---
+title: "Script 4: Modelling"
+output:
+  pdf_document: default
+  html_document: default
+Purpose: Modelling N2O Emissions(/Flux)
+---
+
+```{r}
+# Core libraries
+library(readxl)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(sf)
+library(raster)
+library(ncdf4)
+library(randomForest)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(maps)
+library(cowplot)
+library(MASS)
+library(scales)
+library(viridis)
+library(caret)
+library(xgboost)
+library(Matrix)
+library(SHAPforxgboost)
+library(mgcv)
+library(blockCV)
+library(factoextra)
+library(terra)
+```
+
+STEP 1: Load and Clean Observational Data
+
+```{r}
+# ---- STEP 1: Load and Clean N2O Observational Data ----
+# Load Excel file
+df <- read_excel("Data_N2O_Guided Research_Shaivan_v1.xlsx")
+
+# Clean decimal format
+df <- df %>%
+  mutate(`N2O Emission (μmol N₂O m⁻² d⁻¹)` = gsub(",", ".", `N2O Emission (μmol N₂O m⁻² d⁻¹)`))
+
+# Rename and clean up columns
+df_clean <- df %>%
+  rename(lat = `Latitude (°)`,
+         lon = `Longitude (°)`,
+         flux_raw = `N2O Emission (μmol N₂O m⁻² d⁻¹)`,
+         type = `Point or Region`) %>%
+  mutate(
+    lat = as.numeric(lat),
+    lon = as.numeric(lon),
+    flux = flux_raw %>%
+      as.character() %>%
+      str_replace_all("\u00A0", "") %>%
+      str_replace_all("−", "-") %>%
+      str_replace_all(",", ".") %>%
+      str_trim() %>%
+      as.numeric()
+  )
+
+# Keep only valid point observations
+df_points <- df_clean %>%
+  filter(type == "Point", !is.na(lat), !is.na(lon), !is.na(flux))
+
+# Summary
+summary(df_points$flux)
+```
+
+```{r}
+# ---- STEP 2: Extract Environmental Predictors from NetCDF ----
+# Setup spatial points for extraction
+# Convert sampling coordinates to terra SpatVector
+coords_vect <- vect(df_points, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+# ---- Helper function: extract surface variable from NetCDF ----
+extract_var <- function(nc_file, varname, label, df) {
+  r <- rast(nc_file, subds = varname)
+  # Assign CRS explicitly to avoid transformation warnings
+  crs(r) <- "EPSG:4326"
+  surface <- r[[grep("depth=0", names(r))]]
+  vals <- terra::extract(surface, coords_vect)[, 2]
+  df[[label]] <- vals
+  return(df)
+}
+
+# ---- Extract WOA environmental variables ----
+df_points <- extract_var("woa2023_Nitrate.nc",    "n_an", "nitrate",     df_points)
+df_points <- extract_var("woa2023_Phosphate.nc",  "p_an", "phosphate",   df_points)
+df_points <- extract_var("woa2023_DisOxygen.nc",  "o_an", "oxygen",      df_points)
+df_points <- extract_var("woa2023_Salinity.nc",   "s_an", "salinity",    df_points)
+df_points <- extract_var("woa2023_Temperature.nc","t_an","temperature",  df_points)
+df_points <- extract_var("woa2018_Density.nc",    "I_an", "density",     df_points)
+
+# ---- Bathymetry (depth) ----
+bathy_raster <- rast("GEBCO_2025_sub_ice.nc")
+df_points$depth <- terra::extract(bathy_raster, coords_vect)[, 2]
+
+# ---- Chlorophyll (Copernicus, surface only) ----
+chl_file1 <- "cmems_mod_glo_bgc_my_0.25deg_P1M-m_1760291720536.nc"      # 1993–2022
+chl_file2 <- "cmems_mod_glo_bgc_myint_0.25deg_P1M-m_1760291822771.nc"   # 2023–2025
+r1 <- rast(chl_file1)
+r2 <- rast(chl_file2)
+
+surface_names_r1 <- grep("chl_depth=0.50576", names(r1), value = TRUE)
+surface_names_r2 <- grep("chl_depth=0.50576", names(r2), value = TRUE)
+
+chl_stack1 <- r1[[surface_names_r1]]
+chl_stack2 <- r2[[surface_names_r2]]
+chl_full_stack <- c(chl_stack1, chl_stack2)
+chlorophyll_r <- mean(chl_full_stack, na.rm = TRUE)
+
+df_points$chlorophyll <- terra::extract(chlorophyll_r, coords_vect)[, 2]
+```
+
+```{r}
+# STEP 3: Prepare dataset for modeling
+predictor_vars <- c("temperature", "salinity", "oxygen", "nitrate",
+                    "phosphate", "chlorophyll", "density", "depth")
+target_var <- "flux"
+
+# Keep complete rows only
+df_model <- df_points %>%
+  dplyr::select(all_of(c(target_var, predictor_vars))) %>%
+  filter(complete.cases(.))
+
+# Summary check
+print(nrow(df_model))
+summary(df_model)
+```
+
+```{r}
+# STEP 4: Split into Training and Test Sets
+set.seed(42)
+train_indices <- sample(seq_len(nrow(df_model)), size = 0.8 * nrow(df_model))
+train_data <- df_model[train_indices, ]
+test_data  <- df_model[-train_indices, ]
+```
+
+```{r}
+# STEP 5: Train Random Forest Model
+# ================================================================
+rf_model <- randomForest(
+  flux ~ .,
+  data = train_data,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_model)
+varImpPlot(rf_model)
+
+# Evaluate performance on test set
+pred_test <- predict(rf_model, newdata = test_data)
+cat("Test RMSE:", sqrt(mean((pred_test - test_data$flux)^2)), "\n")
+cat("Test R²:", cor(pred_test, test_data$flux)^2, "\n")
+
+# Plot observed vs predicted
+ggplot(data.frame(obs = test_data$flux, pred = pred_test),
+       aes(x = obs, y = pred)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(x = "Observed Flux", y = "Predicted Flux",
+       title = "Random Forest N2O Flux Prediction") +
+  theme_minimal()
+
+```
+
+10-Fold Cross Validation
+
+```{r}
+# ----  Train Random Forest Model with 10-fold Cross-Validation ----
+set.seed(42)
+
+# Define 10-fold CV setup
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  verboseIter = TRUE,
+  savePredictions = "final"
+)
+
+# Define tuning grid for mtry (number of variables tried at each split)
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10))
+
+# Run cross-validated training
+rf_cv <- train(
+  flux ~ .,
+  data = df_model,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_cv)
+plot(rf_cv)
+
+# Extract best parameters and performance
+best_mtry <- rf_cv$bestTune$mtry
+mean_R2   <- rf_cv$results$Rsquared[rf_cv$results$mtry == best_mtry]
+mean_RMSE <- rf_cv$results$RMSE[rf_cv$results$mtry == best_mtry]
+cat("Best mtry:", best_mtry, "\n")
+cat("10-fold CV mean R²:", round(mean_R2, 3), "\n")
+cat("10-fold CV mean RMSE:", round(mean_RMSE, 3), "\n")
+
+# ---- Retrain final Random Forest model using full dataset and best mtry ----
+rf_final <- randomForest(
+  flux ~ .,
+  data = df_model,
+  ntree = 500,
+  mtry = best_mtry,
+  importance = TRUE
+)
+
+saveRDS(rf_final, "rf_final_model.rds")
+
+# Variable importance
+varImpPlot(rf_final, main = "Variable Importance (10-fold RF Model)")
+```
+
+```{r}
+# ---- STEP 6: Evaluate Final 10-fold CV Model ----
+# Predict using final model (trained on full dataset)
+pred_final <- predict(rf_final, newdata = df_model)
+
+# Compute performance metrics (approximation on full data)
+r_squared_final <- cor(pred_final, df_model$flux)^2
+rmse_final <- sqrt(mean((pred_final - df_model$flux)^2))
+
+cat("Final RF Model R² (approx.):", round(r_squared_final, 3), "\n")
+cat("Final RF Model RMSE (approx.):", round(rmse_final, 3), "\n")
+cat("Cross-validated R² (10-fold mean):", round(mean_R2, 3), "\n")
+cat("Cross-validated RMSE (10-fold mean):", round(mean_RMSE, 3), "\n")
+```
+
+```{r}
+# ---- STEP 7: Visualization and Diagnostics (10-fold RF Model) ----
+# Variable Importance
+varImpPlot(rf_final, main = "Variable Importance (10-fold RF Model)")
+
+# Predicted vs Observed (using full dataset)
+pred_final <- predict(rf_final, newdata = df_model)
+
+plot(df_model$flux, pred_final,
+     xlab = expression("Observed N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+     ylab = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+     main = "Observed vs Predicted N2O Flux (10-fold RF Model)",
+     pch = 16, col = "blue")
+abline(0, 1, col = "red", lwd = 2)
+
+# ------ # ------
+# Fit GAM with smooth terms
+gam_model <- gam(flux ~ s(temperature) + s(salinity) + s(oxygen) + 
+                   s(nitrate) + s(phosphate) + s(chlorophyll) + 
+                   s(density) + s(depth), data = train_data)
+
+# Predict and evaluate
+gam_preds <- predict(gam_model, newdata = test_data)
+gam_r2 <- cor(gam_preds, test_data$flux)^2
+gam_rmse <- sqrt(mean((gam_preds - test_data$flux)^2))
+
+cat("GAM R²:", round(gam_r2, 3), "\n")
+cat("GAM RMSE:", round(gam_rmse, 3), "\n")
+```
+
+```{r}
+# ---- STEP 8: Add Coordinates as Predictors ----
+# Extract lon/lat back from spatial object
+coords <- crds(coords_vect)
+
+df_points$lon <- coords[, 1]
+df_points$lat <- coords[, 2]
+```
+
+```{r}
+# ---- STEP 9: Add Log-transformed Flux ----
+df_points <- df_points %>%
+  mutate(log_flux = log(flux + 1e-3))  # Add epsilon to avoid log(0)
+
+# ---- STEP 10: Prepare Enhanced Modelling Dataset ----
+predictor_vars_extended <- c("temperature", "salinity", "oxygen", "nitrate", 
+                             "phosphate", "chlorophyll", "density", "depth", 
+                             "lat", "lon")
+target_var_log <- "log_flux"
+
+# Only keep complete cases
+model_data_extended <- df_points %>%
+  dplyr::select(dplyr::all_of(c(target_var_log, predictor_vars_extended))) %>%
+  filter(if_all(everything(), ~ !is.na(.)))
+```
+
+```{r}
+# ================================================================
+# ---- STEP 11–13: Secondary Manual Train/Test RF (for comparison) ----
+# ================================================================
+
+# ---- STEP 11: Split into Training and Test Sets (80/20) ----
+set.seed(123)
+train_indices_log <- sample(seq_len(nrow(model_data_extended)), size = 0.8 * nrow(model_data_extended))
+train_data_log <- model_data_extended[train_indices_log, ]
+test_data_log  <- model_data_extended[-train_indices_log, ]
+
+# ---- STEP 12: Train Random Forest on Log-Flux ----
+rf_log <- randomForest(
+  log_flux ~ ., 
+  data = train_data_log, 
+  ntree = 500,
+  importance = TRUE
+)
+
+# ---- STEP 13: Evaluate Log-Flux Model ----
+pred_log_flux_log <- predict(rf_log, newdata = test_data_log)
+pred_flux_log <- exp(pred_log_flux_log)  # Back-transform
+
+# Compare to actual (non-log) flux
+actual_flux_log <- exp(test_data_log$log_flux)
+
+r_squared_log <- cor(pred_flux_log, actual_flux_log)^2
+rmse_log <- sqrt(mean((pred_flux_log - actual_flux_log)^2))
+mae_log <- mean(abs(pred_flux_log - actual_flux_log))
+bias_log <- mean(pred_flux_log - actual_flux_log)
+
+# Calibration slope (regression)
+cal_model_log <- lm(actual_flux_log ~ pred_flux_log)
+slope_log <- coef(cal_model_log)[2]
+
+cat("\n===== Manual 80/20 RF Model (log-transformed) =====\n")
+cat("Test R²:", round(r_squared_log, 3), "\n")
+cat("Test RMSE:", round(rmse_log, 3), "\n")
+cat("MAE:", round(mae_log, 3), "\n")
+cat("Bias:", round(bias_log, 3), "\n")
+cat("Calibration Slope:", round(slope_log, 3), "\n")
+
+# ---- Optional: Visualize Performance ----
+varImpPlot(rf_log, main = "Variable Importance (RF, log-transformed 80/20 Model)")
+
+plot(actual_flux_log, pred_flux_log,
+     xlab = "Observed Flux (µmol m⁻² d⁻¹)",
+     ylab = "Predicted Flux",
+     main = "Observed vs Predicted (RF, log-transformed 80/20 Model)",
+     pch = 16, col = "darkgreen")
+abline(0, 1, col = "red", lwd = 2)
+```
+
+```{r}
+# ================================================================
+# ---- STEP 14–15: Visualize Manual 80/20 RF Model ----
+# ================================================================
+
+# ---- STEP 14: Variable Importance ----
+varImpPlot(rf_log, main = "Variable Importance (Manual 80/20 RF, log-transformed)")
+
+# ---- STEP 15: Observed vs Predicted Plot (Back-transformed) ----
+plot(actual_flux_log, pred_flux_log,
+     xlab = "Observed Flux (µmol m⁻² d⁻¹)",
+     ylab = "Predicted Flux (µmol m⁻² d⁻¹)",
+     main = "Observed vs Predicted Flux (Manual 80/20 RF, log-transformed)",
+     pch = 16, col = "darkgreen")
+abline(0, 1, col = "red", lwd = 2)
+```
+
+```{r}
+# ================================================================
+# ---- STEP 16: Residual Analysis and Mapping (Manual 80/20 RF Model) ----
+# ================================================================
+
+# Calculate residuals (Observed - Predicted)
+test_data_log$pred_flux <- pred_flux_log
+test_data_log$actual_flux <- actual_flux_log
+test_data_log$residual <- test_data_log$actual_flux - test_data_log$pred_flux
+
+# ---- Plot Residuals vs Predicted ----
+plot(test_data_log$pred_flux, test_data_log$residual,
+     xlab = "Predicted Flux (µmol m⁻² d⁻¹)",
+     ylab = "Residual (Observed - Predicted)",
+     main = "Residuals vs Predicted (Manual 80/20 RF, log-transformed)",
+     pch = 16, col = "darkred")
+abline(h = 0, col = "blue", lwd = 2)
+
+# ---- Create Spatial Object for Mapping ----
+residual_map_sf <- st_as_sf(
+  test_data_log,
+  coords = c("lon", "lat"),
+  crs = 4326
+)
+
+# ---- Get World Basemap ----
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# ---- Determine symmetric color scale ----
+max_resid <- max(abs(test_data_log$residual), na.rm = TRUE)
+
+# ---- Plot Spatial Distribution of Residuals ----
+ggplot() +
+  geom_sf(data = world, fill = "grey95", color = "grey70") +  # Land background
+  geom_sf(data = residual_map_sf, aes(color = residual), size = 1) +
+  scale_color_gradient2(
+    low = "blue", mid = "grey", high = "red",
+    midpoint = 0,
+    name = "Residual\n(Observed - Predicted)"
+  ) +
+  coord_sf(xlim = c(-40, 40), ylim = c(20, 75), expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Spatial Distribution of N₂O Flux Residuals (Manual 80/20 RF)",
+    subtitle = "Europe and Surrounding Seas (Blue = Overprediction, Red = Underprediction)"
+  )
+```
+
+```{r}
+# ================================================================
+# Residual Analysis for Final 10-fold RF Model
+# ================================================================
+
+# 1. Compute predicted and residual values
+df_model$pred_flux <- pred_final
+df_model$residual  <- df_model$flux - df_model$pred_flux
+
+# 2. Plot Residuals vs Predicted
+plot(df_model$pred_flux, df_model$residual,
+     xlab = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+     ylab = expression("Residual (Observed - Predicted)"),
+     main = "Residuals vs Predicted (10-fold RF Model)",
+     pch = 16, col = "darkred")
+abline(h = 0, col = "blue", lwd = 2)
+
+# 3. Optionally visualize with ggplot (nicer aesthetics)
+library(ggplot2)
+
+ggplot(df_model, aes(x = pred_flux, y = residual)) +
+  geom_point(alpha = 0.6, color = "darkred") +
+  geom_hline(yintercept = 0, color = "blue", linetype = "dashed") +
+  labs(x = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+       y = expression("Residual (Observed - Predicted)"),
+       title = "Residuals vs Predicted (10-fold RF Model)") +
+  theme_minimal()
+
+# 4. Create spatial object for mapping (if lon/lat columns exist)
+if(all(c("lon", "lat") %in% colnames(df_model))) {
+  library(sf)
+  residual_map_sf <- st_as_sf(
+    df_model,
+    coords = c("lon", "lat"),
+    crs = 4326
+  )
+}
+
+# 5. Optional: Summary stats of residuals
+summary(df_model$residual)
+hist(df_model$residual, breaks = 30, col = "gray", main = "Residual Distribution",
+     xlab = "Residual (Observed - Predicted)")
+
+ggplot(df_model, aes(x = pred_flux, y = abs(residual))) +
+  geom_point(alpha = 0.6, color = "brown") +
+  geom_smooth(method = "loess", color = "blue", se = FALSE) +
+  labs(x = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+       y = "Absolute Residual",
+       title = "Absolute Residuals vs Predicted (10-fold RF Model)") +
+  theme_minimal()
+
+
+ggplot(residual_map_sf) +
+  geom_sf(aes(color = residual)) +
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = 4) +
+  labs(title = "Spatial Distribution of Residuals (10-fold RF Model)",
+       color = "Residual") +
+  theme_minimal()
+```
+
+```{r}
+# ---------------------------------------------------------------------- # 
+# ---------------------------------------------------------------------- # 
+# ---- STEP A: Comparing to Yang et al., 2020's Predicted N2O Flux
+# ---- STEP A1: Loading and Extracting Yang et al.,2020's Predicted Flux ----
+# --- Load Yang et al. (2020) dataset properly as SpatRaster ---
+# --- 1. Load Yang et al. (2020) ensemble flux (SpatRaster) ---
+yang_file <- "n2oFlux-Yang2020.nc"
+
+# Load ensemble mean (use terra::rast to avoid class mismatch)
+yang_flux_raster <- rast(yang_file, subds = "n2oFlux_EnsMean_g-pm2-pyr")
+
+# --- 2. Convert units: g N₂O m⁻² yr⁻¹ → µmol N₂O m⁻² d⁻¹ ---
+# (1 g N₂O = (1 / 44) mol = (1e6 / 44) µmol; divide by 365 for daily)
+yang_flux_raster_umol <- yang_flux_raster * (1e6 / 44) / 365
+
+# Some NetCDFs contain multiple layers (e.g., monthly). Collapse to mean.
+yang_flux_umol_mean <- mean(yang_flux_raster_umol, na.rm = TRUE)
+names(yang_flux_umol_mean) <- "Yang_Flux_umol"
+
+# Optional: quick check
+print(yang_flux_umol_mean)
+summary(values(yang_flux_umol_mean))
+
+# --- 3. Prepare coordinate data for extraction ---
+# Add lat/lon from df_points if not already present
+model_data_extended$lat <- df_points$lat[seq_len(nrow(model_data_extended))]
+model_data_extended$lon <- df_points$lon[seq_len(nrow(model_data_extended))]
+
+# Remove missing coordinates
+model_data_extended <- model_data_extended %>% filter(!is.na(lat) & !is.na(lon))
+
+# Convert to SpatVector for terra::extract
+coords_vect <- vect(model_data_extended, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+# --- 4. Extract Yang flux values at observation points ---
+model_data_extended$flux_yang <- terra::extract(yang_flux_umol_mean, coords_vect)[, 1]
+
+# --- 5. Predict N₂O fluxes using final 10-fold Random Forest model ---
+pred_flux_final <- exp(predict(rf_final, newdata = model_data_extended))
+
+# --- 6. Compute correlation ---
+ok <- complete.cases(pred_flux_final, model_data_extended$flux_yang)
+cor_rf_yang_final <- cor(pred_flux_final[ok], model_data_extended$flux_yang[ok])
+cat("Correlation between 10-fold RF predictions and Yang et al. (2020):",
+    round(cor_rf_yang_final, 3), "\n")
+
+# --- 7. Visualize comparison ---
+ggplot(model_data_extended[ok, ], aes(x = pred_flux_final[ok], y = flux_yang)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "lm", color = "darkred") +
+  labs(
+    title = "This Study's 10-fold RF Predictions vs Yang et al. (2020)",
+    x = expression("This Study Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+    y = expression("Yang et al. (2020) Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+# ---- STEP B: Include Yang et al. (2020) Flux as Predictor ----
+cat("\n===== STEP B: Including Yang et al. (2020) Flux =====\n")
+
+# Ensure Yang flux is extracted correctly
+if (!"flux_yang" %in% names(df_points)) {
+  cat("Extracting Yang et al. (2020) flux...\n")
+  
+  yang_file <- "n2oFlux-Yang2020.nc"
+  yang_flux_raster <- raster(yang_file, varname = "n2oFlux_EnsMean_g-pm2-pyr")  # Ensemble mean
+
+  # Convert from g N m⁻² yr⁻¹ → µmol N₂O m⁻² d⁻¹
+  yang_flux_raster_umol <- yang_flux_raster * (1e6 / 44) / 365
+  
+  coords_sf <- st_as_sf(df_points, coords = c("lon", "lat"), crs = 4326)
+  df_points$flux_yang <- raster::extract(yang_flux_raster_umol, coords_sf)
+  
+  cat("Extraction complete.\n")
+} else {
+  cat("Yang flux already present.\n")
+}
+
+# Check for completeness
+summary(df_points$flux_yang)
+
+# Remove rows with missing data
+df_points <- df_points %>% filter(complete.cases(.))
+
+# ---- Define predictors including Yang flux ----
+predictors_with_yang <- c("temperature", "salinity", "oxygen", "nitrate", 
+                          "phosphate", "chlorophyll", "density", "depth", 
+                          "lat", "lon", "flux_yang")
+
+# Prepare modeling dataset
+df_model_with_yang <- df_points %>%
+  mutate(log_flux = log(flux + 1e-3)) %>%
+  dplyr::select(log_flux, dplyr::all_of(predictors_with_yang)) %>%
+  filter(if_all(everything(), ~ !is.na(.)))
+
+# Split into training/testing
+set.seed(123)
+train_idx_yang <- sample(seq_len(nrow(df_model_with_yang)), size = 0.8 * nrow(df_model_with_yang))
+train_yang <- df_model_with_yang[train_idx_yang, ]
+test_yang  <- df_model_with_yang[-train_idx_yang, ]
+
+# ---- Train Random Forest including Yang flux ----
+rf_yang_model <- randomForest(
+  log_flux ~ ., 
+  data = train_yang, 
+  ntree = 500, 
+  importance = TRUE
+)
+
+# ---- Evaluate performance ----
+pred_log_flux_yang <- predict(rf_yang_model, newdata = test_yang)
+pred_flux_yang <- exp(pred_log_flux_yang)
+actual_flux_yang <- exp(test_yang$log_flux)
+
+r2_yang <- cor(pred_flux_yang, actual_flux_yang)^2
+rmse_yang <- sqrt(mean((pred_flux_yang - actual_flux_yang)^2))
+mae_yang <- mean(abs(pred_flux_yang - actual_flux_yang))
+
+cat("\n===== Enhanced Model with Yang Flux =====\n")
+cat("Test R²:", round(r2_yang, 3), "\n")
+cat("Test RMSE:", round(rmse_yang, 3), "\n")
+cat("Test MAE:", round(mae_yang, 3), "\n")
+
+# ---- Variable Importance ----
+varImpPlot(rf_yang_model, main = "Variable Importance (RF + Yang Flux)")
+
+# ---- Observed vs Predicted ----
+plot(actual_flux_yang, pred_flux_yang,
+     xlab = "Observed Flux (µmol m⁻² d⁻¹)",
+     ylab = "Predicted Flux (µmol m⁻² d⁻¹)",
+     main = "Observed vs Predicted (RF + Yang Flux)",
+     pch = 16, col = "darkblue")
+abline(0, 1, col = "red", lwd = 2)
+
+
+
+# ---- FIXED & VERIFIED: Extract Yang et al. (2020) N₂O flux ----
+cat("\n===== STEP: Extracting Yang et al. (2020) Flux =====\n")
+
+# Load raster and ensure correct variable name
+yang_file <- "n2oFlux-Yang2020.nc"
+yang_flux_raster <- raster(yang_file, varname = "n2oFlux_EnsMean_g-pm2-pyr")
+
+# Convert units: g N₂O m⁻² yr⁻¹ → µmol N₂O m⁻² d⁻¹
+yang_flux_raster_umol <- yang_flux_raster * (1e6 / 44) / 365
+names(yang_flux_raster_umol) <- "flux_yang"
+
+# Force CRS consistency
+crs(yang_flux_raster_umol) <- "EPSG:4326"
+coords_sf <- st_as_sf(df_points, coords = c("lon", "lat"), crs = 4326)
+
+# Extract flux values
+cat("Extracting values from Yang raster...\n")
+df_points$flux_yang <- raster::extract(yang_flux_raster_umol, coords_sf)
+
+# Check success
+if (!"flux_yang" %in% names(df_points)) {
+  stop("Extraction failed: flux_yang not found in df_points")
+}
+
+na_rate <- mean(is.na(df_points$flux_yang))
+if (na_rate > 0.5) {
+  cat("⚠️ Warning: More than 50% NA values detected in flux_yang. Check coordinate alignment or raster extent.\n")
+} else {
+  cat("Extraction successful. Missing values:", round(na_rate * 100, 1), "%\n")
+}
+
+# Preview values
+summary(df_points$flux_yang)
+```
+
+```{r}
+# ---- STEP C: Add Biome Classification from Yang et al.,2020 ----
+# ---- STEP C1: Load Yang’s Biome Raster and Extract Biome Labels
+# Load Yang et al. biome raster from NetCDF
+yang_file <- "dn2o-mapped-Yang2020.nc"
+
+# Extract biome classification (1 to 6 as per their legend)
+biome_raster <- raster(yang_file, varname = "biomes_masks")
+
+# Extract biome category at your observation points
+coords_sf_biome <- st_as_sf(df_points, coords = c("lon", "lat"), crs = 4326)
+df_points$biome <- raster::extract(biome_raster, coords_sf_biome)
+
+# Convert biome to factor
+df_points$biome <- factor(df_points$biome,
+                          levels = 1:6,
+                          labels = c("Tropical", "Upwelling", "Polar", "Mid-lat", "DeepMix", "SubtropicalGyre"))
+
+
+# ---- STEP C2: Add Biome to Model and Train Again
+# Add biome to your list of predictors
+predictors_biome <- c(predictors_with_yang, "biome")  # All previous predictors + biome
+
+# Filter complete cases
+df_model_biome <- df_points %>%
+  dplyr::select(log_flux, dplyr::all_of(predictors_biome)) %>%
+  dplyr::filter(dplyr::if_all(everything(), ~ !is.na(.)))
+
+# Split
+set.seed(123)
+train_idx_biome <- sample(seq_len(nrow(df_model_biome)), size = 0.8 * nrow(df_model_biome))
+train_biome <- df_model_biome[train_idx_biome, ]
+test_biome  <- df_model_biome[-train_idx_biome, ]
+
+# Train model
+rf_model_biome <- randomForest(log_flux ~ ., data = train_biome, ntree = 500, importance = TRUE)
+
+# Evaluate
+pred_biome_log <- predict(rf_model_biome, newdata = test_biome)
+pred_biome <- exp(pred_biome_log)
+actual_biome <- exp(test_biome$log_flux)
+
+cat("\n===== Model with Biome Included =====\n")
+cat("Test R²:", round(cor(pred_biome, actual_biome)^2, 3), "\n")
+cat("Test RMSE:", round(sqrt(mean((pred_biome - actual_biome)^2)), 3), "\n")
+
+# Optional: Variable importance
+varImpPlot(rf_model_biome, main = "RF Variable Importance (Biome Included)")
+```
+
+```{r}
+# ---- STEP D: Analyze Residuals by Biome or Region
+# ---- STEP D1: Compute Residuals and Attach to Biomes
+test_biome$residual <- actual_biome - pred_biome
+test_biome$biome <- test_biome$biome  # Already present from training split
+
+# ---- STEP D2: Boxplot of Residuals by Biome
+ggplot(test_biome, aes(x = biome, y = residual)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Residuals by Ocean Biome", x = "Biome", y = "Residual (Observed - Predicted)") +
+  theme_minimal()
+
+# ---- STEP D3: Spatial Bias Map # This will be left out for the article/ just something Yang 2020 did
+# Start from df_model_biome, which matches test_biome row-for-row
+res_coords <- df_model_biome[-train_idx_biome, ] %>%
+  dplyr::select(lat, lon) %>%
+  mutate(residual = test_biome$residual)
+
+res_coords_europe <- res_coords %>%
+  filter(lon >= -30, lon <= 60,
+         lat >= 30, lat <= 75)
+
+ggplot(res_coords_europe, aes(x = lon, y = lat, color = residual)) +
+  geom_point(size = 1.5) +
+  scale_color_gradient2(
+    low = "blue", mid = "lightyellow", high = "red", midpoint = 0,
+    name = "Residual (µmol m⁻² d⁻¹)"
+  ) +
+  borders("world", colour = "gray60", fill = "gray90") +
+  coord_quickmap(xlim = c(-30, 60), ylim = c(30, 75)) +
+  theme_minimal() +
+  labs(
+    title = "Geographic Residuals over Europe",
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+```
+
+```{r}
+# ---- STEP E: Making Gridded Predictions ----
+# ---- STEP E1: Stack Gridded Predictors into a Raster Brick
+# 1. Load raw raster layers (keep only surface = depth 0)
+temperature_r <- rast("woa2023_Temperature.nc", subds = "t_an")
+temperature_r <- temperature_r[[grep("depth=0", names(temperature_r))]]
+
+salinity_r <- rast("woa2023_Salinity.nc", subds = "s_an")
+salinity_r <- salinity_r[[grep("depth=0", names(salinity_r))]]
+
+oxygen_r <- rast("woa2023_DisOxygen.nc", subds = "o_an")
+oxygen_r <- oxygen_r[[grep("depth=0", names(oxygen_r))]]
+
+nitrate_r <- rast("woa2023_Nitrate.nc", subds = "n_an")
+nitrate_r <- nitrate_r[[grep("depth=0", names(nitrate_r))]]
+
+phosphate_r <- rast("woa2023_Phosphate.nc", subds = "p_an")
+phosphate_r <- phosphate_r[[grep("depth=0", names(phosphate_r))]]
+
+density_r <- rast("woa2018_Density.nc", subds = "I_an")
+density_r <- density_r[[grep("depth=0", names(density_r))]]
+
+depth_r <- rast("GEBCO_2025_sub_ice.nc")  # already 1 layer
+
+# 2. Load and average chlorophyll (already surface-only)
+chl_file1 <- "cmems_mod_glo_bgc_my_0.25deg_P1M-m_1760291720536.nc"
+chl_file2 <- "cmems_mod_glo_bgc_myint_0.25deg_P1M-m_1760291822771.nc"
+
+r1 <- rast(chl_file1)
+r2 <- rast(chl_file2)
+
+surface_names_r1 <- grep("chl_depth=0.50576", names(r1), value = TRUE)
+surface_names_r2 <- grep("chl_depth=0.50576", names(r2), value = TRUE)
+
+chl_stack1 <- r1[[surface_names_r1]]
+chl_stack2 <- r2[[surface_names_r2]]
+
+chl_full_stack <- c(chl_stack1, chl_stack2)
+chlorophyll_r <- mean(chl_full_stack, na.rm = TRUE)
+
+# 3. Crop to European extent
+extent_europe <- ext(-35, 50, 20, 80)
+rasters_uncropped <- list(
+  temperature_r, salinity_r, oxygen_r, nitrate_r,
+  phosphate_r, chlorophyll_r, density_r, depth_r
+)
+raster_list_cropped <- lapply(rasters_uncropped, function(r) crop(r, extent_europe))
+
+# 4. Align CRS
+for (i in seq_along(raster_list_cropped)) {
+  crs(raster_list_cropped[[i]]) <- "EPSG:4326"
+}
+
+# 5. Align grids
+ref_raster <- raster_list_cropped[[1]]
+raster_list_aligned <- lapply(raster_list_cropped, function(r)
+  resample(r, ref_raster, method = "bilinear")
+)
+
+# 6. Stack aligned rasters
+predictor_stack <- rast(raster_list_aligned)
+names(predictor_stack) <- c("temperature", "salinity", "oxygen", "nitrate",
+                            "phosphate", "chlorophyll", "density", "depth")
+
+# 7. Check
+predictor_stack
+plot(predictor_stack)
+
+
+# ---- STEP E2: Predict N₂O Flux Across Europe Using RF Model ----
+# Add Latitude and Longitude as Raster Layers ---
+# --- Rebuild latitude and longitude rasters correctly ---
+# Each one should have ONE layer only, aligned to the predictor grid
+lat_raster <- rast(predictor_stack[[1]])  # copy geometry
+lon_raster <- rast(predictor_stack[[1]])
+
+# Fill with coordinate values
+lat_raster[] <- yFromCell(lat_raster, 1:ncell(lat_raster))
+lon_raster[] <- xFromCell(lon_raster, 1:ncell(lon_raster))
+
+# Check that they’re single-layer rasters
+nlyr(lat_raster)
+nlyr(lon_raster)  
+
+# Combine everything
+predictor_stack_full <- c(predictor_stack, lat_raster, lon_raster)
+
+# Verify number of layers (should be 10)
+nlyr(predictor_stack_full)
+
+names(predictor_stack_full) <- c("temperature", "salinity", "oxygen", "nitrate",
+                                 "phosphate", "chlorophyll", "density", "depth",
+                                 "lat", "lon")
+
+# Predict log-fluxes using the final 10-fold cross-validated model
+predicted_log_flux <- terra::predict(
+  object   = predictor_stack_full,
+  model    = rf_final,
+  na.rm    = TRUE,
+  progress = TRUE
+)
+
+# Back-transform to µmol N₂O m⁻² d⁻¹
+predicted_flux <- exp(predicted_log_flux)
+names(predicted_flux) <- "Predicted_N2O_Flux"
+
+# Save and visualize
+writeRaster(predicted_flux, "Predicted_N2O_Flux_Europe_RFfinal.tif", overwrite = TRUE)
+
+plot(predicted_flux, col = viridis::viridis(100),
+     main = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"))
+
+cat("Predicted flux mean:", round(global(predicted_flux, "mean", na.rm = TRUE)[[1]], 3), "\n")
+cat("Predicted flux range:", round(global(predicted_flux, "min", na.rm = TRUE)[[1]], 3), "–",
+    round(global(predicted_flux, "max", na.rm = TRUE)[[1]], 3), "\n")
+
+# Mask land using bathymetry
+# ocean_mask <- depth_r < 0
+# predicted_flux_ocean <- mask(predicted_flux, ocean_mask)
+
+# Convert to data frame for ggplot
+# pred_df <- as.data.frame(predicted_flux_ocean, xy = TRUE)
+# names(pred_df)[3] <- "flux"
+# pred_df <- pred_df[!is.na(pred_df$flux), ]
+
+# Plot with coastlines
+# land <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+#ggplot() + geom_raster(data = pred_df, aes(x = x, y = y, fill = flux)) +
+# geom_sf(data = land, fill = "gray90", color = "gray50", size = 0.2) +
+# scale_fill_viridis(
+#   name = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+#   option = "C"
+# ) +
+# coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+# theme_minimal() +
+#   labs(
+#   title = expression("Predicted N"[2]*"O Flux Across Europe"),
+#    x = "Longitude",
+#    y = "Latitude"
+#  ) +
+#  theme(plot.title = element_text(hjust = 0.5, face = "bold")) 
+```
+
+```{r}
+# ---- Compare with Yang et al. (2020) Gridded Flux -----
+# Load Yang et al. (2020) flux (g N2O m⁻² yr⁻¹)
+yang_flux_raster <- terra::rast("n2oFlux-Yang2020.nc", subds = "n2oFlux_EnsMean_g-pm2-pyr")
+
+# Crop to your study extent
+yang_flux_cropped <- terra::crop(yang_flux_raster, predicted_flux)
+
+# Resample to match your model grid
+yang_flux_resampled <- terra::resample(yang_flux_cropped, predicted_flux, method = "bilinear")
+
+# Compute mean across 12 layers (if monthly)
+yang_flux_mean <- mean(yang_flux_resampled, na.rm = TRUE)
+
+# Convert to µmol N2O m⁻² d⁻¹
+# 1 g N₂O = (1 / 44) mol N₂O = (1e6 / 44) µmol N₂O
+# Divide by 365 for per day
+yang_flux_mean_umol <- yang_flux_mean * (1e6 / (44 * 365))
+names(yang_flux_mean_umol) <- "Yang_N2O_Flux_umol_m2_d"
+
+# Plot Yang mean
+plot(yang_flux_mean_umol, main = "Yang et al. (2020) Mean N₂O Flux",
+     col = viridis::viridis(100))
+
+# ---- Compare with your predicted flux ----
+# Extract paired values
+vals <- as.data.frame(c(predicted_flux, yang_flux_mean_umol))
+names(vals) <- c("your_flux", "yang_flux")
+vals <- vals[complete.cases(vals), ]
+
+# Summary and correlation
+cat("Number of valid cells:", nrow(vals), "\n")
+cat("Correlation between your model and Yang (2020):",
+    round(cor(vals$your_flux, vals$yang_flux), 3), "\n")
+
+# ---- Plot comparison ----
+par(mfrow = c(1, 3))
+plot(predicted_flux, main = "a) This Study's N2O Flux",
+     col = viridis::viridis(100))
+plot(yang_flux_mean_umol, main = "b) Yang et al. (2020)'s N2O Flux",
+     col = viridis::viridis(100))
+plot(predicted_flux - yang_flux_mean_umol, main = "c) Difference",
+     col = viridis::viridis(100))
+
+
+# ================================================================
+## Compare Final 10-fold RF Gridded Flux vs Yang et al. (2020) ----
+# ================================================================
+
+# Combine your predicted flux (from rf_final) and Yang’s mean flux
+vals <- as.data.frame(c(predicted_flux, yang_flux_mean_umol))
+names(vals) <- c("rf_final_flux", "yang_flux")
+vals <- vals[complete.cases(vals), ]
+
+# ---- Summary and correlation ----
+cat("Number of valid grid cells:", nrow(vals), "\n")
+cat("Correlation (10-fold RF vs Yang 2020):",
+    round(cor(vals$rf_final_flux, vals$yang_flux), 3), "\n")
+
+# ---- Plot side-by-side comparison ----
+par(mfrow = c(1, 3))
+plot(predicted_flux,
+     main = "a) This Study: RF (10-fold) Predicted N₂O Flux",
+     col = viridis::viridis(100))
+plot(yang_flux_mean_umol,
+     main = "b) Yang et al. (2020) Mean N₂O Flux",
+     col = viridis::viridis(100))
+plot(predicted_flux - yang_flux_mean_umol,
+     main = "c) Difference (This Study − Yang 2020)",
+     col = viridis::viridis(100))
+
+# ---- Optionally: Compute basic summary stats ----
+rf_mean  <- global(predicted_flux, "mean", na.rm = TRUE)[[1]]
+yang_mean <- global(yang_flux_mean_umol, "mean", na.rm = TRUE)[[1]]
+cat("Mean RF (10-fold) flux:", round(rf_mean, 3), "\n")
+cat("Mean Yang (2020) flux:", round(yang_mean, 3), "\n")
+cat("Difference in means:", round(rf_mean - yang_mean, 3), "\n")
+```
+
+```{r}
+# ================================================================
+# ---- Compare Final 10-fold RF Gridded Flux vs Yang et al. (2020)
+# ================================================================
+
+# ---- 1. Load Yang et al. flux and crop to Europe ----
+yang_flux_raster <- rast("n2oFlux-Yang2020.nc", subds = "n2oFlux_EnsMean_g-pm2-pyr")
+yang_flux_cropped <- crop(yang_flux_raster, predicted_flux)
+yang_flux_resampled <- resample(yang_flux_cropped, predicted_flux, method = "bilinear")
+
+# ---- 2. Convert to µmol N₂O m⁻² d⁻¹ ----
+yang_flux_umol_all <- yang_flux_resampled * (1e6 / (44 * 365))
+yang_flux_umol <- mean(yang_flux_umol_all, na.rm = TRUE)
+names(yang_flux_umol) <- "Yang_N2O_Flux_umol_m2_d"
+
+# ---- 3. Align to your RF grid ----
+yang_flux_umol <- project(yang_flux_umol, predicted_flux)
+
+# ---- 4. Pairwise comparison ----
+vals <- as.data.frame(c(predicted_flux, yang_flux_umol))
+names(vals) <- c("rf_flux", "yang_flux")
+vals <- vals[complete.cases(vals), ]
+
+# ---- 5. Summary ----
+cat("Number of valid grid cells:", nrow(vals), "\n")
+cat("Correlation (10-fold RF vs Yang 2020):", round(cor(vals$rf_flux, vals$yang_flux), 3), "\n")
+
+rf_mean   <- global(predicted_flux, "mean", na.rm = TRUE)[[1]]
+yang_mean <- global(yang_flux_umol, "mean", na.rm = TRUE)[[1]]
+cat("Mean RF flux:", round(rf_mean, 3), "\n")
+cat("Mean Yang flux:", round(yang_mean, 3), "\n")
+cat("Difference:", round(rf_mean - yang_mean, 3), "\n")
+
+# ---- 6. Define color limits to suppress outliers ----
+rf_lim   <- c(0, 3)   # realistic range for coastal fluxes
+yang_lim <- c(-1, 3)
+diff_lim <- c(-1.5, 1.5)
+
+# ---- 7. Plot side-by-side ----
+par(mfrow = c(1, 3))
+
+plot(predicted_flux,
+     main = "a) This Study Predicted Flux",
+     col = viridis(100),
+     range = rf_lim)
+plot(yang_flux_umol,
+     main = "b) Yang et al.(2020) Mean Flux",
+     col = viridis(100),
+     range = yang_lim)
+plot(predicted_flux - yang_flux_umol,
+     main = "c) Difference",
+     col = viridis(100),
+     range = diff_lim)
+```
+
+```{r}
+# Fix the plor rows again
+par(mfrow = c(1,1))
+
+# ---- 6. Define color limits to suppress outliers ----
+rf_lim   <- c(0, 3)   # realistic range for coastal fluxes
+yang_lim <- c(-1, 3)
+diff_lim <- c(-1.5, 1.5)
+
+plot(predicted_flux,
+     main = "a) This Study Predicted Flux",
+     col = viridis(100),
+     range = rf_lim)
+```
+
+```{r}
+# ---- STEP 17: RandomForest Hyperparameter Tuning (Same model but trying a better configuration) ----
+# Define tuning grid
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10))
+
+# Train model using caret
+ctrl <- trainControl(method = "cv", number = 5)  # 5-fold CV
+
+rf_tuned <- train(
+  log_flux ~ ., 
+  data = train_data_ext, 
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_tuned)
+plot(rf_tuned)
+```
+
+```{r}
+# ---- STEP 18: Train Basic XGBoost Model (Using predictors available for grid) ----
+#  Define matching predictors (for both model and gridded stack)
+predictors_basic <- c("lat", "lon", "temperature", "salinity", "oxygen", 
+                      "nitrate", "phosphate", "chlorophyll", "density", "depth")
+
+#  Prepare cleaned input data with only these predictors
+xgb_data_basic <- df_points %>%
+  mutate(log_flux = log(flux + 1e-3)) %>%  # re-define here if needed
+  dplyr::select(log_flux, dplyr::all_of(predictors_basic)) %>%
+  filter(if_all(everything(), ~ !is.na(.)))
+
+#  Extract predictor matrix and target vector
+X_basic <- as.matrix(xgb_data_basic[, predictors_basic])  # predictor matrix
+y_basic <- xgb_data_basic$log_flux                        # target vector
+
+#  Add explicit column names to matrix BEFORE DMatrix
+colnames(X_basic) <- predictors_basic
+
+#  Train/test split
+set.seed(42)
+train_idx_basic <- sample(seq_len(nrow(X_basic)), size = 0.8 * nrow(X_basic))
+X_train_basic <- X_basic[train_idx_basic, ]
+y_train_basic <- y_basic[train_idx_basic]
+X_test_basic  <- X_basic[-train_idx_basic, ]
+y_test_basic  <- y_basic[-train_idx_basic]
+
+#  DMatrix for XGBoost
+dtrain_basic <- xgb.DMatrix(data = X_train_basic, label = y_train_basic)
+dtest_basic  <- xgb.DMatrix(data = X_test_basic, label = y_test_basic)
+
+#  Train basic XGBoost model
+xgb_model_basic <- xgboost(
+  data = dtrain_basic,
+  nrounds = 200,
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  verbose = 0
+)
+
+#  Predict and evaluate
+pred_log_basic <- predict(xgb_model_basic, newdata = dtest_basic)
+pred_flux_basic <- exp(pred_log_basic)
+actual_flux_basic <- exp(y_test_basic)
+
+#  Evaluation metrics
+r2_basic <- cor(pred_flux_basic, actual_flux_basic)^2
+rmse_basic <- sqrt(mean((pred_flux_basic - actual_flux_basic)^2))
+cat("Basic XGBoost Model R²:", round(r2_basic, 3), "\n")
+cat("Basic XGBoost Model RMSE:", round(rmse_basic, 3), "\n")
+```
+
+```{r}
+#  ---- XGBoost Model with 10-Fold Cross-Validation ----
+# ================================================================
+
+set.seed(42)
+
+# Define matching predictors
+predictors_basic <- c("lat", "lon", "temperature", "salinity", "oxygen",
+                      "nitrate", "phosphate", "chlorophyll", "density", "depth")
+
+# Prepare cleaned dataset
+xgb_data_basic <- df_points %>%
+  mutate(log_flux = log(flux + 1e-3)) %>%
+  dplyr::select(log_flux, dplyr::all_of(predictors_basic)) %>%
+  filter(if_all(everything(), ~ !is.na(.)))
+
+# --------------------------
+# Use caret::train for CV
+# --------------------------
+ctrl_xgb <- trainControl(
+  method = "cv",
+  number = 10,          # 10-fold cross-validation
+  verboseIter = TRUE,
+  savePredictions = "final"
+)
+
+# Define hyperparameter grid 
+xgb_grid <- expand.grid(
+  nrounds = c(200, 300),
+  max_depth = c(4, 6),
+  eta = c(0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = c(0.8),
+  min_child_weight = 1,
+  subsample = c(0.8)
+)
+
+# Train cross-validated XGBoost model
+xgb_cv <- train(
+  log_flux ~ .,
+  data = xgb_data_basic,
+  method = "xgbTree",
+  trControl = ctrl_xgb,
+  tuneGrid = xgb_grid,
+  verbose = TRUE
+)
+
+print(xgb_cv)
+plot(xgb_cv)
+
+# Extract best hyperparameters
+best_params <- xgb_cv$bestTune
+cat("Best XGBoost parameters:\n")
+print(best_params)
+
+# Mean cross-validated performance
+best_results <- xgb_cv$results[
+  with(xgb_cv$results,
+       nrounds == best_params$nrounds &
+       max_depth == best_params$max_depth &
+       eta == best_params$eta),
+]
+cat("10-fold CV mean R²:", round(best_results$Rsquared, 3), "\n")
+cat("10-fold CV mean RMSE:", round(best_results$RMSE, 3), "\n")
+
+# Retrain final model on full dataset with best parameters
+final_xgb <- xgboost(
+  data = xgb.DMatrix(as.matrix(xgb_data_basic[, predictors_basic]),
+                     label = xgb_data_basic$log_flux),
+  nrounds = best_params$nrounds,
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  verbose = 0
+)
+
+saveRDS(final_xgb, "xgb_final_model.rds")
+```
+
+```{r}
+# ---- STEP 19: Gridded Prediction Using Basic XGBoost Model ----
+# 1. Convert raster stack to dataframe with coordinates
+grid_df_basic <- as.data.frame(predictor_stack_full, xy = TRUE, na.rm = TRUE)
+
+# 2. Ensure proper column names
+names(grid_df_basic)[1:2] <- c("lon", "lat")
+
+# 3.Drop missing values
+grid_df_basic <- grid_df_basic[complete.cases(grid_df_basic), ]
+
+# 4. Use the exact same predictors as training
+predictors_basic <- c("lat", "lon", "temperature", "salinity", "oxygen", 
+                      "nitrate", "phosphate", "chlorophyll", "density", "depth")
+
+# 5. Subset and reorder columns
+grid_matrix_basic <- as.matrix(grid_df_basic[, predictors_basic])
+colnames(grid_matrix_basic) <- predictors_basic  # match training model
+
+# 6. Convert to DMatrix for XGBoost
+grid_dmatrix_basic <- xgb.DMatrix(data = grid_matrix_basic)
+
+# ---- Predict using the 10-fold validated XGBoost model ----
+grid_log_pred_basic <- predict(final_xgb, newdata = grid_dmatrix_basic)
+grid_flux_pred_basic <- exp(grid_log_pred_basic)
+
+# Add predictions back to dataframe
+grid_df_basic$flux_xgb_final <- grid_flux_pred_basic
+
+# 9. Convert to raster for visualization
+raster_flux_basic <- terra::rast(
+  terra::ext(predictor_stack_full),
+  nrows = nrow(predictor_stack_full),
+  ncols = ncol(predictor_stack_full),
+  crs   = crs(predictor_stack_full)
+)
+
+raster_flux_basic <- terra::rast(
+  data.frame(x = grid_df_basic$lon, 
+             y = grid_df_basic$lat, 
+             flux_xgb_final = grid_df_basic$flux_xgb_final),
+  crs = crs(predictor_stack_full)
+)
+
+names(raster_flux_basic) <- "flux_xgb_final"
+
+plot(raster_flux_basic,
+     main = "Gridded N₂O Flux Prediction (Final 10-fold XGBoost)",
+     col = viridis::viridis(100))
+
+# Formatting
+# Remove duplicated columns (e.g. keep only "x" and "y")
+grid_df_basic <- grid_df_basic[, !duplicated(names(grid_df_basic))]
+
+# Optionally rename x/y for clarity
+# grid_df_basic <- grid_df_basic %>%
+#  rename(lon = x, lat = y)
+# Remove duplicate column names
+grid_df_basic <- grid_df_basic[, !duplicated(names(grid_df_basic))]
+
+# Double-check names
+names(grid_df_basic)
+
+# ggplot map
+land <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+ggplot() +
+  geom_raster(data = grid_df_basic, aes(x = lon, y = lat, fill = flux_xgb_final)) + 
+  geom_sf(data = land, fill = "gray90", color = "gray50") +
+  scale_fill_viridis(
+    name = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+    option = "C"
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Gridded N2O Flux Prediction (Basic XGBoost)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+ggplot() +
+  geom_raster(data = grid_df_basic, aes(x = lon, y = lat, fill = flux_xgb_final)) + 
+  geom_sf(data = land, fill = "gray90", color = "gray50") +
+  scale_fill_viridis(
+    name = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+    option = "C",
+    limits = c(-0.2, 0.5),        # <-- restrict color scale range
+    oob = scales::squish      # <-- squish out-of-range values into bounds
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Gridded N2O Flux Prediction (Basic XGBoost)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+ggplot() +
+  geom_raster(data = grid_df_basic, aes(x = lon, y = lat, fill = flux_xgb_final)) +
+  geom_sf(data = land, fill = "gray90", color = "gray50") +
+  scale_fill_gradientn(
+    name   = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+    colours = c("#08306B",  # deep blue
+                "#2171B5",  # blue
+                "#41B6C4",  # cyan/teal
+                "#7FCDBB",  # light teal
+                "#41AE76",  # green
+                "#006D2C"), # dark green
+    limits = c(-0.4, 0.4),      
+    oob    = scales::squish
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Gridded N2O Flux Prediction (Basic XGBoost)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+# ---- STEP 20: Final 10-Fold Validated XGBoost Model Summary ----
+# This section replaces the manual tuning step
+
+# Load predictors (same as before)
+predictors_basic <- c("lat", "lon", "temperature", "salinity", "oxygen", 
+                      "nitrate", "phosphate", "chlorophyll", "density", "depth")
+
+# If needed, reload the 10-fold validated model
+final_xgb <- readRDS("xgb_final_model.rds")
+
+# Evaluate 10-fold CV performance (already computed)
+cat("\n===== Final 10-Fold Cross-Validated XGBoost Model =====\n")
+cat("Best parameters:\n")
+print(best_params)
+cat("10-fold CV mean R²:", round(best_results$Rsquared, 3), "\n")
+cat("10-fold CV mean RMSE:", round(best_results$RMSE, 3), "\n")
+
+# Compute variable importance
+importance_final <- xgb.importance(model = final_xgb)
+xgb.plot.importance(importance_matrix = importance_final, top_n = 10,
+                    main = "Variable Importance (Final 10-Fold XGBoost)")
+
+```
+
+```{r}
+# ---- STEP 21: Gridded Prediction Using Final 10-Fold XGBoost Model ----
+
+# Convert predictor stack (with lat/lon included) to dataframe
+grid_df_final <- as.data.frame(predictor_stack_full, xy = TRUE)
+
+# Remove duplicate names if they exist
+grid_df_final <- grid_df_final[, !duplicated(names(grid_df_final))]
+
+# Rename coordinate columns if needed
+names(grid_df_final)[names(grid_df_final) == "x"] <- "lon"
+names(grid_df_final)[names(grid_df_final) == "y"] <- "lat"
+
+# Drop rows with missing values
+grid_df_final <- grid_df_final[complete.cases(grid_df_final), ]
+
+# Define predictor list (must match your model)
+predictors_basic <- c("lat", "lon", "temperature", "salinity", "oxygen",
+                      "nitrate", "phosphate", "chlorophyll", "density", "depth")
+
+# Check all predictors exist
+missing_cols <- setdiff(predictors_basic, names(grid_df_final))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing columns in grid_df_final:", paste(missing_cols, collapse = ", ")))
+}
+
+# Extract matrix for prediction
+grid_matrix_final <- as.matrix(grid_df_final[, predictors_basic])
+colnames(grid_matrix_final) <- predictors_basic
+
+# Convert to DMatrix and predict using final 10-fold validated model
+grid_dmatrix_final <- xgb.DMatrix(data = grid_matrix_final)
+grid_log_flux_final <- predict(final_xgb, newdata = grid_dmatrix_final)
+grid_flux_final <- exp(grid_log_flux_final)
+
+# Add predictions to dataframe
+grid_df_final$flux_xgb_final <- grid_flux_final
+
+# Convert to raster for visualization
+raster_flux_final <- rasterFromXYZ(grid_df_final[, c("lon", "lat", "flux_xgb_final")])
+
+# Plot raster
+plot(raster_flux_final,
+     main = "Gridded N₂O Flux Prediction (Final 10-Fold XGBoost)",
+     col = viridis::viridis(100))
+
+# ---- ggplot version for map ----
+land <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+ggplot() +
+  geom_raster(data = grid_df_final, aes(x = lon, y = lat, fill = flux_xgb_final)) +
+  geom_sf(data = land, fill = "gray90", color = "gray50") +
+  scale_fill_viridis(
+    name = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+    option = "C"
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Gridded N₂O Flux Prediction (Final 10-Fold XGBoost)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+plot(rf_cv)
+
+varImpPlot(rf_final, main = "Variable Importance (10-fold RF Model)")
+
+plot(xgb_cv)
+
+importance_final <- xgb.importance(model = final_xgb)
+xgb.plot.importance(importance_matrix = importance_final, top_n = 10,
+                    main = "Variable Importance (Final 10-Fold XGBoost)")
+```
+
+```{r}
+# -------------------------------------------
+# Scenario Analysis: N₂O Flux Sensitivity
+# Based on predictor_stack and XGBoost tuned model
+# -------------------------------------------
+# Clone base stack
+stack_base <- predictor_stack
+
+# Define scenario modifications
+stack_temp2C <- stack_base
+stack_temp2C[["temperature"]] <- stack_temp2C[["temperature"]] + 2
+
+stack_oxygen20 <- stack_base
+stack_oxygen20[["oxygen"]] <- stack_oxygen20[["oxygen"]] * 0.8
+
+stack_nutrient20 <- stack_base
+stack_nutrient20[["nitrate"]] <- stack_nutrient20[["nitrate"]] * 1.2
+stack_nutrient20[["phosphate"]] <- stack_nutrient20[["phosphate"]] * 1.2
+
+stack_multi <- stack_base
+stack_multi[["temperature"]] <- stack_multi[["temperature"]] + 2
+stack_multi[["oxygen"]] <- stack_multi[["oxygen"]] * 0.8
+stack_multi[["nitrate"]] <- stack_multi[["nitrate"]] * 1.2
+stack_multi[["phosphate"]] <- stack_multi[["phosphate"]] * 1.2
+
+# Convert
+to_grid_df <- function(stack) {
+  df <- as.data.frame(stack, xy = TRUE)
+  df <- df[complete.cases(df), ]
+  df
+}
+
+df_base <- to_grid_df(stack_base)
+df_temp <- to_grid_df(stack_temp2C)
+df_o2   <- to_grid_df(stack_oxygen20)
+df_nut  <- to_grid_df(stack_nutrient20)
+df_multi <- to_grid_df(stack_multi)
+
+# --- CLEAN COLUMN NAMES ---
+fix_coords <- function(df) {
+  # Remove duplicate names
+  df <- df[, !duplicated(names(df))]
+  
+  # Rename coordinate columns
+  if ("x" %in% names(df)) names(df)[names(df) == "x"] <- "lon"
+  if ("y" %in% names(df)) names(df)[names(df) == "y"] <- "lat"
+  
+  return(df)
+}
+
+df_base  <- fix_coords(df_base)
+df_temp  <- fix_coords(df_temp)
+df_o2    <- fix_coords(df_o2)
+df_nut   <- fix_coords(df_nut)
+df_multi <- fix_coords(df_multi)
+
+predict_flux <- function(df, predictors, model) {
+  mat <- as.matrix(df[, predictors])
+  colnames(mat) <- predictors
+  pred <- predict(model, newdata = mat)
+  exp(pred)
+}
+
+
+# ---- Predict flux for each scenario using the final 10-fold model ----
+predictors <- predictors_basic  # already defined earlier
+
+df_base$flux  <- predict_flux(df_base,  predictors, final_xgb)
+df_temp$flux  <- predict_flux(df_temp,  predictors, final_xgb)
+df_o2$flux    <- predict_flux(df_o2,    predictors, final_xgb)
+df_nut$flux   <- predict_flux(df_nut,   predictors, final_xgb)
+df_multi$flux <- predict_flux(df_multi, predictors, final_xgb)
+
+# Calculate deltas (flux difference from baseline)
+df_temp$delta <- df_temp$flux - df_base$flux
+df_o2$delta   <- df_o2$flux - df_base$flux
+df_nut$delta  <- df_nut$flux - df_base$flux
+df_multi$delta <- df_multi$flux - df_base$flux
+
+# Visualize difference
+plot_scenario <- function(df, title) {
+  ggplot(df, aes(x = lon, y = lat, fill = delta)) +
+    geom_raster() +
+    geom_sf(data = land, inherit.aes = FALSE,
+            fill = "gray90", color = "gray50", size = 0.1) +
+    scale_fill_gradient2(
+      low = "blue", mid = "grey", high = "red", midpoint = 0,
+      name = expression(Delta * "N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")")
+    ) +
+    coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+    theme_minimal() +
+    labs(title = title, x = "Longitude", y = "Latitude") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+
+plot_scenario <- function(df, title) {
+  ggplot(df, aes(x = lon, y = lat, fill = delta)) +
+    geom_raster() +
+    geom_sf(data = land, inherit.aes = FALSE,
+            fill = "gray90", color = "gray50", size = 0.1) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red",
+      limits = c(-0.5, 0.5),        # ADD A LIMIT
+      oob = scales::squish,     
+      midpoint = 0,
+      name = expression(Delta * "N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")")
+    ) +
+    coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+    theme_minimal() +
+    labs(title = title, x = "Longitude", y = "Latitude") +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "right"
+    )
+}
+
+plot_scenario(df_temp,  "a) Scenario: +2°C Temperature")
+ plot_scenario(df_o2,    "b) Scenario: -20% Oxygen")
+ plot_scenario(df_nut,   "c) Scenario: +20% Nutrients")
+ plot_scenario(df_multi, "d) Scenario: Combined Drivers")
+
+ # ---- Quantify Scenario Magnitudes ----
+# Function to summarize flux changes
+summarize_scenario <- function(df, name) {
+  baseline_mean <- mean(df_base$flux, na.rm = TRUE)
+  delta_mean <- mean(df$delta, na.rm = TRUE)
+  delta_median <- median(df$delta, na.rm = TRUE)
+  percent_change <- (mean(df$flux, na.rm = TRUE) - baseline_mean) / baseline_mean * 100
+  data.frame(
+    Scenario = name,
+    Mean_Delta = delta_mean,
+    Median_Delta = delta_median,
+    Percent_Change = percent_change
+  )
+}
+
+scen_stats <- rbind(
+  summarize_scenario(df_temp, "Warming (+2°C)"),
+  summarize_scenario(df_o2,   "Deoxygenation (−20% O₂)"),
+  summarize_scenario(df_nut,  "Nutrient enrichment (+20%)"),
+  summarize_scenario(df_multi,"Combined drivers")
+)
+
+print(scen_stats)
+```
+
+```{r}
+# =============================================================
+# ---- Model Uncertainty: Bootstrap Random Forests (10-fold RF) ----
+# =============================================================
+
+# Parameters
+n_bootstrap <- 100   
+set.seed(42)
+
+# ---- Ensure lat/lon layers exist ----
+lat_raster <- rast(predictor_stack[[1]])
+lon_raster <- rast(predictor_stack[[1]])
+lat_raster[] <- yFromCell(lat_raster, 1:ncell(lat_raster))
+lon_raster[] <- xFromCell(lon_raster, 1:ncell(lon_raster))
+
+predictor_stack_full <- c(predictor_stack, lat_raster, lon_raster)
+names(predictor_stack_full) <- c(
+  "temperature", "salinity", "oxygen", "nitrate", "phosphate",
+  "chlorophyll", "density", "depth", "lat", "lon"
+)
+
+# ---- Prepare clean dataset for bootstrapping ----
+predictor_vars <- c("temperature", "salinity", "oxygen", "nitrate",
+                    "phosphate", "chlorophyll", "density", "depth", "lat", "lon")
+
+# Keep only predictors + target variable
+model_data_boot <- model_data_extended %>%
+  dplyr::select(all_of(c("log_flux", predictor_vars))) %>%
+  filter(complete.cases(.))
+
+# ---- Initialize storage for bootstrap results ----
+bootstrap_rasters <- list()
+
+# ---- Display progress bar (helps me to keep track how long it might take ----
+pb <- txtProgressBar(min = 0, max = n_bootstrap, style = 3)
+
+# ---- Bootstrap loop ----
+for (i in 1:n_bootstrap) {
+  cat("\nTraining bootstrap model:", i, "\n")
+  
+  # Sample with replacement
+  boot_idx <- sample(nrow(model_data_boot), replace = TRUE)
+  boot_data <- model_data_boot[boot_idx, ]
+  
+  # Remove any remaining NAs just in case
+  boot_data <- boot_data %>% filter(complete.cases(.))
+  if (nrow(boot_data) == 0) next  # skip if empty
+  
+  # Train bootstrap Random Forest
+  rf_boot <- randomForest(
+    log_flux ~ .,
+    data = boot_data,
+    ntree = 500,
+    mtry = rf_final$mtry
+  )
+  
+  # Predict over gridded stack
+  pred_log_boot <- terra::predict(
+    predictor_stack_full,
+    rf_boot,
+    na.rm = TRUE,
+    progress = FALSE
+  )
+  
+  # Back-transform (log → natural scale)
+  flux_boot <- exp(pred_log_boot)
+  
+  # Store raster
+  bootstrap_rasters[[i]] <- flux_boot
+  
+  # Update progress bar
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+# ---- Combine bootstrap rasters ----
+bootstrap_stack <- rast(bootstrap_rasters)
+
+# ---- Compute mean and standard deviation ----
+flux_mean <- mean(bootstrap_stack, na.rm = TRUE)
+flux_sd   <- app(bootstrap_stack, fun = sd, na.rm = TRUE)
+
+# ---- Plot results ----
+plot(flux_mean, main = "Bootstrap Mean N₂O Flux",
+     col = viridis::viridis(100))
+plot(flux_sd, main = "Prediction Uncertainty (SD)",
+     col = viridis::magma(100))
+
+# ---- Convert to dataframe for ggplot ----
+uncertainty_df <- as.data.frame(flux_sd, xy = TRUE)
+names(uncertainty_df)[3] <- "uncertainty"
+uncertainty_df <- na.omit(uncertainty_df)
+
+# ---- Load land polygons ----
+land <- ne_countries(scale = "medium", returnclass = "sf")
+
+# ---- ggplot visualization ----
+ggplot() +
+  geom_raster(data = uncertainty_df, aes(x = x, y = y, fill = uncertainty)) +
+  geom_sf(data = land, fill = "gray90", color = "gray50", size = 0.2) +
+  scale_fill_viridis(
+    name = expression("Prediction SD (µmol m"^{-2}*" d"^{-1}*")"),
+    option = "C"
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  labs(
+    title = "Prediction Uncertainty (Bootstrap SD)",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+# =================================================
+# ---- MODEL INTERPRETABILITY ----
+# =================================================
+# ----- RANDOM FOREST -----
+# If you trained rf_model (not rf_model_ext)
+varImpPlot(rf_final, main = "Variable Importance (Final 10-Fold RF Model)")
+
+# ----- XGBOOST SHAP INTERPRETATION -----
+# Prepare SHAP input data (same predictors as 10-fold model)
+X_shap <- as.matrix(xgb_data[, predictors_basic])
+colnames(X_shap) <- predictors_basic
+
+# Compute SHAP values using final 10-fold validated XGBoost
+shap_values <- shap.values(final_xgb, X_shap)
+
+# Convert to long format and visualize summary
+shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = X_shap)
+shap.plot.summary(shap_long)
+
+# ---- CLUSTERING OF OBSERVATION ENVIRONMENTS ----
+df_cluster <- df_model %>%
+  dplyr::select(predictor_vars) %>%
+  scale() %>%
+  as.data.frame()
+
+# ---- K-MEANS CLUSTERING ----
+set.seed(42)
+k_clusters <- kmeans(df_cluster, centers = 4)  # Try 3–6 clusters
+
+# Add cluster membership back to df_model
+df_model$cluster <- as.factor(k_clusters$cluster)
+
+# Visualize cluster centroids
+fviz_cluster(k_clusters, data = df_cluster)
+
+# Add spatial coordinates
+df_model$lat <- df_points$lat[match(rownames(df_model), rownames(df_points))]
+df_model$lon <- df_points$lon[match(rownames(df_model), rownames(df_points))]
+
+# Plot clusters on map
+ggplot(df_model, aes(x = lon, y = lat, color = cluster)) +
+  geom_point(size = 2, alpha = 0.8) +
+  borders("world", colour = "gray60", fill = "gray90") +
+  coord_quickmap(xlim = c(-30, 60), ylim = c(30, 75)) +
+  labs(
+    title = "Clustered Environmental Profiles of Coastal Systems",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+# =============================================================
+# 1. RANDOM FOREST VARIABLE IMPORTANCE
+# =============================================================
+
+# Plot variable importance from the final 10-fold RF model
+varImpPlot(rf_final, main = "Variable Importance (Final 10-Fold RF Model)")
+
+# Save the ranked importance data (optional)
+rf_importance <- importance(rf_final)
+rf_importance <- data.frame(Variable = rownames(rf_importance), rf_importance)
+rf_importance <- rf_importance[order(-rf_importance$IncNodePurity), ]
+print(rf_importance)
+
+# =============================================================
+# 2. XGBOOST SHAP INTERPRETATION
+# =============================================================
+
+# --- Recreate the input data used for XGBoost ---
+predictors_basic <- c("lat", "lon", "temperature", "salinity", "oxygen",
+                      "nitrate", "phosphate", "chlorophyll", "density", "depth")
+
+xgb_data <- df_points %>%
+  mutate(log_flux = log(flux + 1e-3)) %>%
+  dplyr::select(log_flux, all_of(predictors_basic)) %>%
+  filter(complete.cases(.))
+
+# Convert to matrix format for SHAP
+X_shap <- as.matrix(xgb_data[, predictors_basic])
+colnames(X_shap) <- predictors_basic
+
+# ---- Compute SHAP values ----
+shap_values <- shap.values(xgb_model = final_xgb, X_train = X_shap)
+
+# ---- Prepare long-format SHAP data ----
+shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = X_shap)
+
+# ---- Plot SHAP summary ----
+shap.plot.summary(shap_long, scientific = FALSE)
+# Interpretation: positive SHAP values = higher contribution to flux increase
+
+# =============================================================
+# 3. ENVIRONMENTAL CLUSTERING (k-means)
+# =============================================================
+
+# Select environmental predictors for clustering (scaled)
+df_cluster <- df_points %>%
+  dplyr::select("temperature", "salinity", "oxygen", "nitrate",
+                "phosphate", "chlorophyll", "density", "depth") %>%
+  filter(complete.cases(.)) %>%
+  scale() %>%
+  as.data.frame()
+
+# ---- Determine optimal cluster number (optional) ----
+# fviz_nbclust(df_cluster, kmeans, method = "wss")
+
+# ---- Run K-means clustering ----
+set.seed(42)
+k_clusters <- kmeans(df_cluster, centers = 4, nstart = 25)
+
+# ---- Add cluster labels back to df_points ----
+df_points$cluster <- as.factor(k_clusters$cluster)
+
+# =============================================================
+# 4. CLUSTER VISUALIZATION
+# =============================================================
+
+# Extract spatial coordinates
+df_points$lon <- as.numeric(df_points$lon)
+df_points$lat <- as.numeric(df_points$lat)
+
+# Create a spatial sf object for mapping
+df_clusters_sf <- st_as_sf(df_points, coords = c("lon", "lat"), crs = 4326)
+
+# World basemap
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# ---- Plot clusters on map ----
+ggplot() +
+  geom_sf(data = world, fill = "gray95", color = "gray70") +
+  geom_sf(data = df_clusters_sf, aes(color = cluster), size = 1, alpha = 0.8) +
+  scale_color_brewer(palette = "Set1", name = "Cluster") +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  labs(
+    title = "Environmental Clusters of European Coastal Systems",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+# ---- Optional: visualize centroids in PCA space ----
+fviz_cluster(k_clusters, data = df_cluster,
+             geom = "point", ellipse.type = "norm",
+             main = "K-means Clustering of Environmental Predictors")
+```
+
+```{r}
+# 1) Choose predictors (same as RF “core 8”)
+predictor_vars <- c("temperature","salinity","oxygen","nitrate",
+                    "phosphate","chlorophyll","density","depth")
+
+# 2) Build clean matrix from your point table
+env_df <- df_points %>%
+  dplyr::select(all_of(c("lat","lon", predictor_vars))) %>%
+  filter(complete.cases(.))
+
+# Diagnostics: zero-variance columns (kill them)
+zv <- sapply(env_df[, predictor_vars, drop = FALSE], function(x) var(x, na.rm = TRUE) == 0)
+if (any(zv)) {
+  message("Removed zero-variance predictors: ", paste(names(zv)[zv], collapse=", "))
+  predictor_vars <- predictor_vars[!zv]
+}
+if (length(predictor_vars) < 2) {
+  stop("Not enough varying predictors to cluster. Aborting clustering.")
+}
+
+# 3) Keep only predictors and de-duplicate identical environments
+X <- env_df[, predictor_vars, drop = FALSE]
+X_unique <- X %>% distinct()
+n_unique <- nrow(X_unique)
+message("Unique environmental rows: ", n_unique)
+
+if (n_unique < 2) {
+  stop("All rows are identical after cleaning; clustering is not feasible.")
+}
+
+# 4) Scale and choose a feasible k automatically
+Xu_scaled <- scale(X_unique)
+k <- max(2, min(4, n_unique - 1))
+message("Using k = ", k, " (auto-selected).")
+
+# 5) Run k-means on UNIQUE environments
+set.seed(42)
+km <- kmeans(Xu_scaled, centers = k, nstart = 50)
+
+# 6) Map cluster labels back to ALL rows
+#    Do exact matching on raw (unscaled) unique rows
+#    (Use a key made from rounded values to avoid floating-point noise)
+key_fun <- function(df) apply(round(as.matrix(df), 6), 1, paste, collapse = "|")
+key_unique <- key_fun(X_unique)
+key_all    <- key_fun(X)
+
+# lookup table: unique-row key -> cluster id
+lut <- setNames(km$cluster, key_unique)
+
+# attach cluster to env_df
+env_df$cluster <- factor(lut[key_all], levels = 1:k,
+                         labels = paste0("Cluster ", 1:k))
+
+# 7) Quick summaries
+print(table(env_df$cluster))
+cluster_centers <- as.data.frame(scale(X_unique) %*% diag(0, ncol(X_unique)))
+# (optional) show scaled centers with names:
+centers_df <- as.data.frame(km$centers)
+centers_df$cluster <- paste0("Cluster ", 1:k)
+centers_df <- centers_df[, c(ncol(centers_df), 1:(ncol(centers_df)-1))]
+print(centers_df)
+
+# 8) Map (only if there are positions for these rows)
+try({
+  world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+  pts_sf <- st_as_sf(env_df, coords = c("lon","lat"), crs = 4326)
+  ggplot() +
+    geom_sf(data = world, fill = "gray95", color = "gray70") +
+    geom_sf(data = pts_sf, aes(color = cluster), alpha = 0.85, size = 1.2) +
+    coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+    scale_color_brewer(palette = "Set1") +
+    labs(title = paste0("Environmental Clusters (k = ", k, ")"),
+         x = "Longitude", y = "Latitude", color = "Cluster") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+}, silent = TRUE)
+
+# 9) Optional: PCA cluster plot (on the unique environments)
+try({
+  fviz_cluster(km, data = Xu_scaled,
+               geom = "point", ellipse.type = "norm",
+               main = paste("K-means on Unique Environments (k =", k, ")"))
+}, silent = TRUE)
+```

@@ -5,8 +5,7 @@ Spatial Analysis of in-situ N2O observations + RandomForest &amp; XGBoost to mod
 
 This repository contains all data, code, and model outputs associated with the study:
 
-“Modeling Nitrous Oxide Fluxes in European Coastal Systems Using Machine Learning:
-Analysing Regional Patterns, Drivers, and Climate Sensitivity.”
+“Modeling Nitrous Oxide Fluxes in European Coastal Systems Using Machine Learning: Analysing Regional Patterns, Drivers, and Climate Sensitivity.”
 
 The project compiles ~8,500 in-situ N₂O flux measurements from European coastal waters (1993–2023), harmonizes them into a single dataset, and applies machine-learning models (Random Forest and XGBoost) to:
 	•	Predict spatial distributions of coastal N₂O fluxes
@@ -17,24 +16,6 @@ The project compiles ~8,500 in-situ N₂O flux measurements from European coasta
 	•	Produce high-resolution (0.25°) gridded maps of coastal emissions
 
 This repository ensures transparency and reproducibility for all analyses presented in the thesis and manuscript.
-
-
-N2O_European_Coastal_Modelling/
-│
-├── data/
-│   ├── Data_N2O_GuidedResearch.xlsx       # harmonised observational database
-│   ├── *.nc                               # environmental predictor NetCDFs (WOA, Copernicus, GEBCO)
-│   └── yang2020/                          # Yang et al. (2020) benchmark flux & dN2O files
-│
-├── scripts/
-│   ├── 01_Overall_Map.R                   # Overall European Plots and data tidying and formatting
-│   ├── 02_Zonal_Plot.R                    # Regional Summaries and Plots
-│   ├── 03_Source_Sink.R                   # Identifying regions as sources or sinks of N2O
-│   ├── 04_Modelling.R                     # Modelling script to predict N2O emissions using RF and XGBoost
-│   ├── 05_Modelling_Updated.Rmd           # Updated and a cleaner version of the modelling script
-|   ├── Bounding_Box.R                     # Create a visualisation of the bounding box for European coastal systems
-| 
-└── README.md
 
 
 Environmental predictors (all long-term climatologies):

@@ -647,6 +647,41 @@ writeRaster(predicted_flux, "Predicted_N2O_Flux_Europe.tif", overwrite = TRUE)
 plot(predicted_flux, col = viridis::viridis(100),
      main = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"))
 
+# Compute total European coastal N2O emission
+# ============================================================
+# 1. Compute area of each grid cell (in m^2)
+#    (terra accounts for varying cell size with latitude)
+cell_area_m2 <- terra::cellSize(predicted_flux, unit = "m")
+
+# 2. Convert flux from µmol N2O m^-2 d^-1 to g N2O m^-2 yr^-1
+#    µmol -> mol: 1e-6
+#    mol -> g N2O: * 44 g/mol
+#    per day -> per year: * 365
+flux_gN2O_m2_yr <- predicted_flux * 1e-6 * 44 * 365
+
+# 3. Total N2O emission per grid cell (g N2O yr^-1)
+cell_emission_gN2O_yr <- flux_gN2O_m2_yr * cell_area_m2
+
+# 4. Sum over all coastal grid cells to get total European emission
+g_sum <- terra::global(cell_emission_gN2O_yr,
+                       fun = "sum",
+                       na.rm = TRUE)
+
+# g_sum is a data.frame with one row and one column (e.g. column "sum")
+total_emission_gN2O_yr <- as.numeric(g_sum[1, 1])
+
+# 5. Convert to Tg N2O yr^-1 and also to Tg N yr^-1 
+total_emission_TgN2O_yr <- total_emission_gN2O_yr / 1e12  # g -> Tg
+
+
+# N2O has 28 g N per 44 g N2O
+total_emission_TgN_yr <- total_emission_TgN2O_yr * (28 / 44)
+
+cat("\n===== Integrated European Coastal Emissions =====\n")
+cat("Total N2O emission:", round(total_emission_TgN2O_yr, 4),
+    "Tg N2O yr^-1\n")
+cat("Total N2O-N emission:", round(total_emission_TgN_yr, 4),
+    "Tg N yr^-1\n")
 
 # Mask land using bathymetry
 # ocean_mask <- depth_r < 0
@@ -718,6 +753,29 @@ plot(yang_flux_mean_umol, main = "Yang et al. (2020) N₂O Flux",
      col = viridis::viridis(100))
 plot(predicted_flux - yang_flux_mean_umol, main = "Difference (My - Yang)",
      col = viridis::viridis(100))
+
+# (a) Your predicted flux
+terra::plot(
+  predicted_flux,
+  main = "a) This Study's Predicted Flux",
+  col  = viridis::viridis(100),
+  range = c(0, 0.6)          # << key change
+)
+
+# (b) Yang et al. (2020)
+terra::plot(
+  yang_flux_mean_umol,
+  main = "b) Yang et al. (2020) Flux",
+  col  = viridis::viridis(100),
+  range = c(0, 2)          # << same scale
+)
+
+# (c) Difference (can keep its own scale)
+terra::plot(
+  predicted_flux - yang_flux_mean_umol,
+  main = "c) Difference",
+  col  = viridis::viridis(100)
+)
 
 # ---------------------------------------------------------------
 # ---------------------------------------------------------------
@@ -1254,6 +1312,43 @@ ggplot() +
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
 
+
+# ---- Relative predictive uncertainty: SD / mean (in %) ----
+eps <- 1e-6  # small number to avoid division by ~0
+flux_mean_safe <- flux_mean
+flux_mean_safe[abs(flux_mean_safe) < eps] <- NA  # ignore cells with ~0 mean flux
+
+flux_rel_uncertainty     <- flux_sd / flux_mean_safe        # unitless
+flux_rel_uncertainty_pct <- flux_rel_uncertainty * 100      # %
+
+names(flux_rel_uncertainty_pct) <- "rel_uncertainty_pct"
+
+summary(values(flux_rel_uncertainty_pct))
+
+# Convert relative uncertainty to dataframe for ggplot
+uncertainty_df <- as.data.frame(flux_rel_uncertainty_pct, xy = TRUE)
+names(uncertainty_df)[3] <- "rel_uncertainty_pct"
+uncertainty_df <- na.omit(uncertainty_df)
+
+ggplot() +
+  geom_raster(data = uncertainty_df,
+              aes(x = x, y = y, fill = rel_uncertainty_pct)) +
+  geom_sf(data = land, fill = "gray90", color = "gray50", size = 0.2) +
+  scale_fill_viridis(
+    name   = "Relative uncertainty (%)",
+    option = "C",
+    # you can tweak limits after seeing summary(), e.g.:
+    # limits = c(0, 80),
+    oob    = scales::squish
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  labs(
+    title = "Prediction Uncertainty (SD / Mean, %)",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
 # =================================================
 # ---- MODEL INTERPRETABILITY ----
 # =================================================
@@ -1305,3 +1400,75 @@ ggplot(df_model, aes(x = lon, y = lat, color = cluster)) +
   ) +
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
+
+
+library(pdp)
+
+pdp_sal <- partial(rf_model, pred.var = "salinity")
+plot(pdp_sal)
+
+# Partial dependence for salinity
+p_sal <- partial(
+  rf_model,
+  pred.var = "salinity",
+  grid.resolution = 50,      # smooth curve
+  train = train_data_ext     # your training data
+)
+
+ggplot(p_sal, aes(x = salinity, y = yhat)) +
+  geom_line(size = 1.2, colour = "#1b9e77") +
+  labs(
+    x = "Salinity",
+    y = "Partial dependence (log-flux)",
+    title = "Partial Dependence of N₂O Flux on Salinity"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+
+vars <- c("salinity", "depth", "temperature ", "oxygen")
+
+p_list <- lapply(vars, function(v) {
+  pd <- partial(rf_model, pred.var = v, grid.resolution = 50)
+  ggplot(pd, aes_string(x = v, y = "yhat")) +
+    geom_line(size = 1.2, colour = "#1b9e77") +
+    labs(x = v, y = "Partial dependence") +
+    theme_minimal(base_size = 12)
+})
+
+library(patchwork)
+wrap_plots(p_list, ncol = 2) +
+  plot_annotation(
+    title = "Partial Dependence Plots for Top Predictors"
+  ) &
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+vars <- c("salinity", "depth", "temperature", "oxygen")
+
+# Custom axis labels WITH UNITS
+var_labels <- c(
+  salinity    = "Salinity (psu)",
+  depth       = "Depth (m)",
+  temperature = "Temperature (°C)",
+  oxygen      = "Oxygen (µmol/kg)"
+)
+
+p_list <- lapply(vars, function(v) {
+  pd <- partial(rf_model, pred.var = v, grid.resolution = 50)
+  
+  ggplot(pd, aes_string(x = v, y = "yhat")) +
+    geom_line(size = 1.2, colour = "#1b9e77") +
+    labs(
+      x = var_labels[[v]],      # ← uses the units here
+      y = "Partial dependence"
+    ) +
+    theme_minimal(base_size = 12)
+})
+
+wrap_plots(p_list, ncol = 2) +
+  plot_annotation(title = "Partial Dependence Plots for Top Predictors") &
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))

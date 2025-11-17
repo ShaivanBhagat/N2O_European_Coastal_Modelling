@@ -1018,6 +1018,35 @@ plot(predicted_flux - yang_flux_umol,
 ```
 
 ```{r}
+# Getting Europe Mean from Yang 2020
+nc <- nc_open("n2oFlux-Yang2020.nc")
+
+# Main flux variable
+yang_flux <- ncvar_get(nc, "n2oFlux_EnsMean_g-pm2-pyr")
+
+# Lat/lon
+yang_lat2d <- ncvar_get(nc, "latitude_2d")
+yang_lon2d <- ncvar_get(nc, "longitude_2d")
+
+nc_close(nc)
+
+mask_europe <- yang_lon2d >= -35 & yang_lon2d <= 50 &
+               yang_lat2d >= 20  & yang_lat2d <= 80
+
+yang_europe_flux <- yang_flux[mask_europe]
+yang_europe_flux_mean <- mean(yang_europe_flux, na.rm = TRUE)
+yang_europe_flux_mean
+
+# convert g m^-2 yr^-1 → µmol m^-2 d^-1
+convert_to_umol_m2_d <- function(x) {
+  x * (1/14) * 1e6 / 365
+}
+
+yang_europe_umol_m2_d <- convert_to_umol_m2_d(yang_europe_flux_mean)
+yang_europe_umol_m2_d
+```
+
+```{r}
 # Fix the plor rows again
 par(mfrow = c(1,1))
 
@@ -1310,6 +1339,29 @@ ggplot() +
                 "#41AE76",  # green
                 "#006D2C"), # dark green
     limits = c(-0.4, 0.4),      
+    oob    = scales::squish
+  ) +
+  coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Gridded N2O Flux Prediction (Basic XGBoost)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+ggplot() +
+  geom_raster(data = grid_df_basic, aes(x = lon, y = lat, fill = flux_xgb_final)) +
+  geom_sf(data = land, fill = "gray90", color = "gray50") +
+  scale_fill_viridis_c(
+    name   = expression("Predicted N"[2]*"O Flux (µmol m"^{-2}*" d"^{-1}*")"),
+    limits = c(-0.1, 0.5
+               ),
     oob    = scales::squish
   ) +
   coord_sf(xlim = c(-30, 60), ylim = c(30, 75), expand = FALSE) +
@@ -1928,4 +1980,20 @@ try({
                geom = "point", ellipse.type = "norm",
                main = paste("K-means on Unique Environments (k =", k, ")"))
 }, silent = TRUE)
+```
+
+```{r}
+flux_mean <- mean(bootstrap_stack, na.rm = TRUE)
+flux_sd   <- app(bootstrap_stack, fun = sd, na.rm = TRUE)
+
+# ---- Plot results ----
+plot(flux_mean, main = "Bootstrap Mean N₂O Flux",
+     col = viridis::viridis(100))
+plot(flux_sd, main = "Prediction Uncertainty (SD)",
+     col = viridis::magma(100))
+
+# ---- Convert to dataframe for ggplot ----
+uncertainty_df <- as.data.frame(flux_sd, xy = TRUE)
+names(uncertainty_df)[3] <- "uncertainty"
+uncertainty_df <- na.omit(uncertainty_df)
 ```

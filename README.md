@@ -26,6 +26,8 @@ Environmental predictors (all long-term climatologies):
 
 All .nc files are provided in the data/ directory unless restricted by license.
 
+Data is now moved to an online respository and can be found via this [link](https://doi.org/10.6084/m9.figshare.31563580)
+
 # Methods Overview
 
 Machine Learning Models
